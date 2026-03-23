@@ -10,7 +10,7 @@ import 'package:flutter/widgets.dart';
 /// Gap (in logical pixels) added between pages in PageView mode.
 /// Appears as a coloured band in the scroll direction; the band colour is the
 /// widget's [PDFView.backgroundColor].
-const double _kPageSpacing = 8.0;
+const double _kPageSpacing = 4.0;
 
 typedef PDFViewCreatedCallback = void Function(PDFViewController controller);
 typedef RenderCallback = void Function(int? pages);
