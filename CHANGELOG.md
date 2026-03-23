@@ -1,3 +1,12 @@
+## 1.5.0
+
+- Migrated iOS and Android rendering from platform views to Flutter textures (`FlutterTexture` / `SurfaceTexture`).
+  - Fixes `MissingPluginException` on `flutter/platform_views` when the plugin is used on a secondary Flutter engine (e.g. an external display running inside a `Presentation` with application context).
+  - Removes the `android-pdf-viewer` (barteksc/mhiew) third-party dependency; Android now uses the built-in `android.graphics.pdf.PdfRenderer`.
+- Multi-page PDFs use a Flutter `PageView` with one texture per page, preserving page-snap and swipe behaviour.
+- Pages with mixed dimensions (e.g. landscape + portrait in the same PDF) are each rendered at their own aspect ratio with correct centering and `backgroundColor` margins.
+- Background colour is correctly applied to the area surrounding PDF pages; page content retains its own background.
+
 ## 1.4.4
 
 - Fixes an Android rendering [#330](https://github.com/endigo/flutter_pdfview/pull/330) @TimelessLin

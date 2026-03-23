@@ -64,6 +64,7 @@ class AndroidPDFTextureRenderer {
     private final int availableHeight;
     private final boolean nightMode;
     private final int backgroundColor;
+    private final int renderMode;
 
     // ── constructor ───────────────────────────────────────────────────────────
 
@@ -76,6 +77,12 @@ class AndroidPDFTextureRenderer {
         availableHeight  = getInt(args, "height", 1200);
         nightMode        = getBool(args, "nightMode");
         backgroundColor  = getInt(args, "backgroundColor", Color.BLACK);
+        // useBestQuality (default true) maps to RENDER_MODE_FOR_PRINT which
+        // produces fully anti-aliased text and sharper vector edges at the cost
+        // of ~2-3× render time vs RENDER_MODE_FOR_DISPLAY.
+        renderMode = getBool(args, "useBestQuality", true)
+                ? PdfRenderer.Page.RENDER_MODE_FOR_PRINT
+                : PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY;
         renderWidth      = availableWidth;
         renderHeight     = availableHeight;
 
@@ -217,11 +224,11 @@ class AndroidPDFTextureRenderer {
                 Matrix transform = new Matrix();
                 transform.postScale(scale, scale);
                 transform.postTranslate(offsetX, offsetY);
-                page.render(bitmap, null, transform, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                page.render(bitmap, null, transform, renderMode);
             } else {
                 // Page dimensions unavailable — fall back to stretch-to-fill.
                 bitmap.eraseColor(Color.WHITE);
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                page.render(bitmap, null, null, renderMode);
             }
 
         } catch (Exception e) {
@@ -391,8 +398,12 @@ class AndroidPDFTextureRenderer {
     }
 
     private static boolean getBool(Map<String, Object> m, String key) {
+        return getBool(m, key, false);
+    }
+
+    private static boolean getBool(Map<String, Object> m, String key, boolean def) {
         Object v = m.get(key);
-        return Boolean.TRUE.equals(v);
+        return v instanceof Boolean ? (Boolean) v : def;
     }
 
     private static Map<String, Object> mapOf(Object... kv) {
