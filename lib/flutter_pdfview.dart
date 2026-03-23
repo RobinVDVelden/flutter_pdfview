@@ -194,8 +194,15 @@ class _PDFViewState extends State<PDFView> {
     if (!mounted || _isDisposed) return;
 
     final mediaQuery = MediaQuery.of(context);
-    final size = mediaQuery.size;
     final pixelRatio = mediaQuery.devicePixelRatio;
+
+    // Use the widget's own rendered size, not the screen size.  When PDFView
+    // is placed inside a container that is smaller than the screen (e.g. a
+    // Card, a Column child, a split-view pane) MediaQuery.size would return
+    // the full screen dimensions, causing the texture to be oversized and
+    // appear stretched inside the smaller widget.
+    final renderBox = context.findRenderObject() as RenderBox?;
+    final size = renderBox?.size ?? mediaQuery.size;
 
     final params = _CreationParams.fromWidget(widget).toMap();
     params['width'] = (size.width * pixelRatio).toInt();
