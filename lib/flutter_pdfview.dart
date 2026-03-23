@@ -151,7 +151,7 @@ class _PDFViewState extends State<PDFView> {
   final Completer<PDFViewController> _controller =
       Completer<PDFViewController>();
 
-  // ── iOS texture state ────────────────────────────────────────────────────
+  // ── Texture state (iOS + Android) ────────────────────────────────────────
 
   static const MethodChannel _factoryChannel =
       MethodChannel('plugins.endigo.io/pdfview_factory');
@@ -171,14 +171,15 @@ class _PDFViewState extends State<PDFView> {
   int _pageCount = 0;
   int _currentPageIndex = 0;
   PageController? _pageController;
-  Map<String, dynamic>? _pageBaseParams; // params reused by each _IOSPageTexture
+  Map<String, dynamic>? _pageBaseParams; // params reused by each _NativePageTexture
 
   // ── lifecycle ────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android) {
       _setupTextureView();
     }
   }
@@ -240,7 +241,7 @@ class _PDFViewState extends State<PDFView> {
       PDFViewController controller;
 
       if (usePageView) {
-        // Dispose the probe renderer — _IOSPageTexture will create per-page ones.
+        // Dispose the probe renderer — _NativePageTexture will create per-page ones.
         _disposeNativeChannel(channelName);
 
         final pageController =
@@ -296,44 +297,14 @@ class _PDFViewState extends State<PDFView> {
 
   @override
   Widget build(BuildContext context) {
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      return PlatformViewLink(
-        viewType: 'plugins.endigo.io/pdfview',
-        surfaceFactory: (
-          BuildContext context,
-          PlatformViewController controller,
-        ) {
-          return AndroidViewSurface(
-            controller: controller as AndroidViewController,
-            gestureRecognizers: widget.gestureRecognizers ??
-                const <Factory<OneSequenceGestureRecognizer>>{},
-            hitTestBehavior: PlatformViewHitTestBehavior.opaque,
-          );
-        },
-        onCreatePlatformView: (PlatformViewCreationParams params) {
-          return PlatformViewsService.initSurfaceAndroidView(
-            id: params.id,
-            viewType: 'plugins.endigo.io/pdfview',
-            layoutDirection: TextDirection.rtl,
-            creationParams: _CreationParams.fromWidget(widget).toMap(),
-            creationParamsCodec: const StandardMessageCodec(),
-          )
-            ..addOnPlatformViewCreatedListener(params.onPlatformViewCreated)
-            ..addOnPlatformViewCreatedListener((int id) {
-              _onPlatformViewCreated(id);
-            })
-            ..create();
-        },
-      );
-    }
-
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android) {
       final bg = widget.backgroundColor ?? const Color(0x00000000);
 
       // ── multi-page swipe mode ──────────────────────────────────────────
       if (_usePageView) {
-        // Directional padding that creates a visible gap between pages while
-        // the user swipes.  The ColoredBox makes the background colour show
+        // Directional padding creates a visible gap between pages while the
+        // user swipes.  The ColoredBox makes the background colour visible
         // through those gaps.
         final EdgeInsets itemPadding = widget.swipeHorizontal
             ? const EdgeInsets.symmetric(horizontal: _kPageSpacing)
@@ -355,7 +326,7 @@ class _PDFViewState extends State<PDFView> {
             itemCount: _pageCount,
             itemBuilder: (ctx, index) => Padding(
               padding: itemPadding,
-              child: _IOSPageTexture(
+              child: _NativePageTexture(
                 pageIndex: index,
                 baseParams: _pageBaseParams!,
                 backgroundColor: bg,
@@ -395,16 +366,6 @@ class _PDFViewState extends State<PDFView> {
         '$defaultTargetPlatform is not yet supported by the pdfview_flutter plugin');
   }
 
-  // ── Android platform-view callback ──────────────────────────────────────
-
-  void _onPlatformViewCreated(int id) {
-    final controller = PDFViewController._fromId(id, widget);
-    if (!_controller.isCompleted) {
-      _controller.complete(controller);
-    }
-    widget.onViewCreated?.call(controller);
-  }
-
   // ── widget update / dispose ──────────────────────────────────────────────
 
   @override
@@ -428,12 +389,12 @@ class _PDFViewState extends State<PDFView> {
 // Per-page texture widget (iOS PageView mode)
 // ---------------------------------------------------------------------------
 
-/// Creates and owns a single [FLTPDFTextureRenderer] for one PDF page.
+/// Creates and owns a single native texture renderer for one PDF page.
 ///
 /// Flutter's [PageView] automatically calls [dispose] when the page scrolls
-/// beyond the cache extent, which unregisters the underlying Metal texture.
-class _IOSPageTexture extends StatefulWidget {
-  const _IOSPageTexture({
+/// beyond the cache extent, which unregisters the underlying texture.
+class _NativePageTexture extends StatefulWidget {
+  const _NativePageTexture({
     required this.pageIndex,
     required this.baseParams,
     required this.backgroundColor,
@@ -456,10 +417,10 @@ class _IOSPageTexture extends StatefulWidget {
   final void Function(dynamic error)? onErrorCallback;
 
   @override
-  State<_IOSPageTexture> createState() => _IOSPageTextureState();
+  State<_NativePageTexture> createState() => _NativePageTextureState();
 }
 
-class _IOSPageTextureState extends State<_IOSPageTexture>
+class _NativePageTextureState extends State<_NativePageTexture>
     with AutomaticKeepAliveClientMixin {
   static const _factoryChannel =
       MethodChannel('plugins.endigo.io/pdfview_factory');
@@ -709,18 +670,8 @@ class _PDFViewSettings {
 // ---------------------------------------------------------------------------
 
 class PDFViewController {
-  /// Android / legacy iOS platform-view path: derives channel name from view id.
-  PDFViewController._fromId(int id, PDFView widget)
-      : _channel = MethodChannel('plugins.endigo.io/pdfview_$id'),
-        _pageController = null,
-        _pageCountGetter = null,
-        _currentPageGetter = null,
-        _widget = widget {
-    _settings = _PDFViewSettings.fromWidget(widget);
-    _channel!.setMethodCallHandler(_onMethodCall);
-  }
-
-  /// iOS single-texture path: uses a pre-created channel returned by the factory.
+  /// Single-texture path (iOS + Android): uses a pre-created channel returned
+  /// by the native texture factory.
   PDFViewController._fromChannel(MethodChannel channel, PDFView widget)
       : _channel = channel,
         _pageController = null,
@@ -731,7 +682,8 @@ class PDFViewController {
     _channel!.setMethodCallHandler(_onMethodCall);
   }
 
-  /// iOS multi-page PageView path: no native channel; drives a PageController.
+  /// Multi-page PageView path (iOS + Android): no native channel; drives a
+  /// Flutter [PageController].
   PDFViewController._fromPageController(
     PageController pageController,
     int Function() pageCountGetter,
