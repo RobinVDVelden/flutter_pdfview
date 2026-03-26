@@ -1,6 +1,17 @@
 import Flutter
-import PDFKit
 import UIKit
+
+// Uses CGPDFDocument (Core Graphics) instead of PDFKit's PDFDocument.
+//
+// PDFDocument eagerly loads and decrypts the entire file on init, spawning
+// high-priority internal work queues that compete with AVAudioEngine's audio
+// DMA on older A-series iPads and cause audible glitches.
+//
+// CGPDFDocument opens only the file's cross-reference table (~few hundred
+// bytes) on init.  Page content — including AES decryption for encrypted
+// PDFs — is loaded lazily on demand when a specific page is drawn.  This
+// keeps the I/O spike at document-open time negligible and prevents audio
+// interference.
 
 // MARK: - Factory
 
@@ -77,7 +88,7 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private let textureRegistry: FlutterTextureRegistry
     private var channel: FlutterMethodChannel!
 
-    private var document: PDFDocument?
+    private var document: CGPDFDocument?
     private var currentPageIndex: Int = 0
     // Settable only within this class; the factory reads it after init to
     // forward the actual texture dimensions back to Flutter.
@@ -85,7 +96,16 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
     private var latestPixelBuffer: CVPixelBuffer?
     private let bufferLock = NSLock()
-    private let renderQueue = DispatchQueue(label: "io.endigo.pdfview.render", qos: .userInitiated)
+
+    // All renderer instances share a single serial queue so that multiple
+    // simultaneous renders (probe + page 0 + page 1 on first open) execute
+    // one at a time instead of saturating the CPU on older hardware.
+    // .background keeps it below AVAudioEngine's scheduling priority.
+    private static let sharedRenderQueue = DispatchQueue(
+        label: "io.endigo.pdfview.render",
+        qos: .background
+    )
+    private var renderQueue: DispatchQueue { Self.sharedRenderQueue }
 
     init(args: [String: Any], textureRegistry: FlutterTextureRegistry, messenger: FlutterBinaryMessenger) {
         self.textureRegistry = textureRegistry
@@ -124,12 +144,13 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     /// outside the crop region are not included in the texture dimensions.
     private func adjustRenderSize(for args: [String: Any]) {
         let defaultPageIndex = (args["defaultPage"] as? NSNumber)?.intValue ?? 0
-        guard let doc = document, doc.pageCount > 0 else { return }
+        guard let doc = document, doc.numberOfPages > 0 else { return }
 
-        let pageIndex = min(defaultPageIndex, doc.pageCount - 1)
-        guard let page = doc.page(at: pageIndex) else { return }
+        // CGPDFDocument page indices are 1-based.
+        let pageIndex = min(defaultPageIndex, doc.numberOfPages - 1)
+        guard let page = doc.page(at: pageIndex + 1) else { return }
 
-        let pageRect = page.bounds(for: .cropBox)
+        let pageRect = page.getBoxRect(.cropBox)
         guard pageRect.width > 0, pageRect.height > 0 else { return }
 
         let available = renderSize
@@ -165,13 +186,16 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     // MARK: - Document loading
 
     private func loadDocument(args: [String: Any]) {
-        var doc: PDFDocument?
+        var doc: CGPDFDocument?
 
         if let filePath = args["filePath"] as? String {
-            let url = URL(fileURLWithPath: filePath)
-            doc = PDFDocument(url: url)
+            let url = URL(fileURLWithPath: filePath) as CFURL
+            doc = CGPDFDocument(url)
         } else if let pdfData = args["pdfData"] as? FlutterStandardTypedData {
-            doc = PDFDocument(data: pdfData.data)
+            let cfData = pdfData.data as CFData
+            if let provider = CGDataProvider(data: cfData) {
+                doc = CGPDFDocument(provider)
+            }
         }
 
         guard let document = doc else {
@@ -183,13 +207,19 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
             return
         }
 
-        if let password = args["password"] as? String, document.isEncrypted {
-            document.unlock(withPassword: password)
+        // Handle encrypted PDFs.  Try the empty string first — PDFs encrypted
+        // with permissions only (no open password) are unlocked this way.
+        if document.isEncrypted {
+            if !document.unlockWithPassword("") {
+                if let password = args["password"] as? String {
+                    _ = document.unlockWithPassword(password)
+                }
+            }
         }
 
         self.document = document
 
-        let pageCount = document.pageCount
+        let pageCount = document.numberOfPages
         let defaultPage = min((args["defaultPage"] as? NSNumber)?.intValue ?? 0, max(0, pageCount - 1))
         self.currentPageIndex = defaultPage
 
@@ -210,8 +240,9 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     // MARK: - Rendering
 
     private func renderPage(_ pageIndex: Int) {
+        // CGPDFDocument page indices are 1-based.
         guard let document = document,
-              let page = document.page(at: pageIndex) else { return }
+              let page = document.page(at: pageIndex + 1) else { return }
 
         let size = renderSize
         let width = Int(size.width)
@@ -253,29 +284,30 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
         context.setFillColor(UIColor.white.cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
-        // Use the crop box (the visible area shown by PDFView) rather than the
-        // media box so that printer bleed / trim marks are excluded.
-        let pageRect = page.bounds(for: .cropBox)
+        // Use the crop box (the visible area shown by PDF viewers) rather than
+        // the media box so that printer bleed / trim marks are excluded.
+        let pageRect = page.getBoxRect(.cropBox)
         let scaleX = CGFloat(width) / pageRect.width
         let scaleY = CGFloat(height) / pageRect.height
         let scale = min(scaleX, scaleY)
 
-        let scaledWidth = pageRect.width * scale
+        let scaledWidth  = pageRect.width  * scale
         let scaledHeight = pageRect.height * scale
-        let offsetX = (CGFloat(width) - scaledWidth) / 2.0
+        let offsetX = (CGFloat(width)  - scaledWidth)  / 2.0
         let offsetY = (CGFloat(height) - scaledHeight) / 2.0
 
-        // CGBitmapContext memory layout already matches the display convention used by
-        // Flutter's Metal texture renderer: no y-flip is needed.  PDFPage.draw places
-        // the page origin at the context origin and draws upward, which produces a
-        // correctly oriented image in the pixel buffer without any additional transform.
+        // CGContextDrawPDFPage and CGBitmapContext both use y-up coordinates.
+        // The CVPixelBuffer memory layout (row 0 = display top) combined with
+        // PDF's y-up coordinate system produces a correctly-oriented image
+        // without an explicit y-flip — the same behaviour as the previous
+        // PDFKit page.draw() implementation.
         context.translateBy(x: offsetX, y: offsetY)
         context.scaleBy(x: scale, y: scale)
         // Normalise the crop box to (0, 0) so pages whose crop box does not
-        // start at the PDF origin are still drawn flush against the texture edge.
+        // start at the PDF origin are drawn flush against the texture edge.
         context.translateBy(x: -pageRect.minX, y: -pageRect.minY)
 
-        page.draw(with: .cropBox, to: context)
+        context.drawPDFPage(page)
 
         CVPixelBufferUnlockBaseAddress(buffer, [])
 
@@ -289,7 +321,7 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private func onMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "pageCount":
-            result(document?.pageCount ?? 0)
+            result(document?.numberOfPages ?? 0)
 
         case "currentPage":
             result(currentPageIndex)
@@ -300,13 +332,13 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
                 result(FlutterError(code: "INVALID_ARGS", message: "Expected 'page' Int argument", details: nil))
                 return
             }
-            guard let doc = document, page >= 0, page < doc.pageCount else {
+            guard let doc = document, page >= 0, page < doc.numberOfPages else {
                 result(false)
                 return
             }
             let previousPage = currentPageIndex
             currentPageIndex = page
-            let pageCount = doc.pageCount
+            let pageCount = doc.numberOfPages
 
             renderQueue.async { [weak self] in
                 guard let self = self else { return }
