@@ -141,6 +141,27 @@ class PDFView extends StatefulWidget {
 
   /// Use to change the background color. ex : "#FF0000" => red
   final Color? backgroundColor;
+
+  /// Returns the total number of pages in the PDF at [filePath] without
+  /// creating a visible widget or rendering any page content.
+  ///
+  /// Supports encrypted PDFs — pass [password] if the file requires one.
+  /// Returns `0` if the file cannot be opened or is not a valid PDF.
+  ///
+  /// Example:
+  /// ```dart
+  /// final pages = await PDFView.getPageCount('/path/to/file.pdf');
+  /// final pages = await PDFView.getPageCount('/path/to/secure.pdf', password: 'secret');
+  /// ```
+  static Future<int> getPageCount(
+    String filePath, {
+    String? password,
+  }) async {
+    const channel = MethodChannel('plugins.endigo.io/pdfview_factory');
+    final args = <String, dynamic>{'filePath': filePath};
+    if (password != null) args['password'] = password;
+    return await channel.invokeMethod<int>('getPageCount', args) ?? 0;
+  }
 }
 
 // ---------------------------------------------------------------------------

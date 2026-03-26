@@ -1,5 +1,10 @@
 package io.endigo.plugins.pdfviewflutter;
 
+import android.graphics.pdf.PdfRenderer;
+import android.os.ParcelFileDescriptor;
+
+import java.io.File;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -68,6 +73,42 @@ class AndroidPDFTextureFactory {
                 AndroidPDFTextureRenderer renderer = renderers.remove(channelName);
                 if (renderer != null) renderer.dispose();
                 result.success(null);
+                break;
+            }
+
+            case "getPageCount": {
+                // Lightweight page-count query — no renderer or texture is created.
+                // Opens a temporary PdfRenderer, reads the page count, then closes
+                // everything immediately.  Supports both plain and encrypted PDFs
+                // (PdfRenderer unlocks permissions-only PDFs automatically).
+                @SuppressWarnings("unchecked")
+                Map<String, Object> args = (Map<String, Object>) call.arguments;
+                if (args == null) {
+                    result.success(0);
+                    return;
+                }
+                String filePath = (String) args.get("filePath");
+                if (filePath == null || filePath.isEmpty()) {
+                    result.success(0);
+                    return;
+                }
+                ParcelFileDescriptor pfd = null;
+                PdfRenderer renderer = null;
+                try {
+                    pfd = ParcelFileDescriptor.open(
+                            new File(filePath), ParcelFileDescriptor.MODE_READ_ONLY);
+                    renderer = new PdfRenderer(pfd);
+                    result.success(renderer.getPageCount());
+                } catch (Exception e) {
+                    result.success(0);
+                } finally {
+                    if (renderer != null) {
+                        try { renderer.close(); } catch (Exception ignored) {}
+                    }
+                    if (pfd != null) {
+                        try { pfd.close(); } catch (IOException ignored) {}
+                    }
+                }
                 break;
             }
 
