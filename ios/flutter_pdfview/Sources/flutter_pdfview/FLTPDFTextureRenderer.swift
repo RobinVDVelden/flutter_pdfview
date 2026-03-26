@@ -97,14 +97,18 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private var latestPixelBuffer: CVPixelBuffer?
     private let bufferLock = NSLock()
 
-    // All renderer instances share a single serial queue so that multiple
-    // simultaneous renders (probe + page 0 + page 1 on first open) execute
-    // one at a time instead of saturating the CPU on older hardware.
-    // .background keeps it below AVAudioEngine's scheduling priority.
+    // All renderer instances share a concurrent queue, capped at 2 simultaneous
+    // renders by the semaphore.  This allows one render per screen (main iPad +
+    // external display) to run in parallel while preventing the 3+ concurrent
+    // renders that would otherwise occur on first open and saturate the CPU on
+    // older hardware, disrupting AVAudioEngine's audio DMA.
+    // .background keeps all render work below the audio thread's priority.
     private static let sharedRenderQueue = DispatchQueue(
         label: "io.endigo.pdfview.render",
-        qos: .background
+        qos: .background,
+        attributes: .concurrent
     )
+    private static let renderSemaphore = DispatchSemaphore(value: 2)
     private var renderQueue: DispatchQueue { Self.sharedRenderQueue }
 
     init(args: [String: Any], textureRegistry: FlutterTextureRegistry, messenger: FlutterBinaryMessenger) {
@@ -225,6 +229,8 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
         renderQueue.async { [weak self] in
             guard let self = self else { return }
+            Self.renderSemaphore.wait()
+            defer { Self.renderSemaphore.signal() }
             self.renderPage(self.currentPageIndex)
             DispatchQueue.main.async {
                 self.textureRegistry.textureFrameAvailable(self.textureId)
@@ -342,6 +348,8 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
             renderQueue.async { [weak self] in
                 guard let self = self else { return }
+                Self.renderSemaphore.wait()
+                defer { Self.renderSemaphore.signal() }
                 self.renderPage(page)
                 DispatchQueue.main.async {
                     self.textureRegistry.textureFrameAvailable(self.textureId)
