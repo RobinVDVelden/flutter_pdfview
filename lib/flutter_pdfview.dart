@@ -250,7 +250,8 @@ class _PDFViewState extends State<PDFView> {
 
       // pageCount is now included in the create() response, saving a round-trip.
       // Fall back to a channel call for backward compatibility with older native builds.
-      final pageCount = (result['pageCount'] as int?) ??
+      // Use [num] so Android int64 maps reliably.
+      final pageCount = (result['pageCount'] as num?)?.toInt() ??
           await MethodChannel(channelName).invokeMethod<int>('pageCount') ??
           1;
 

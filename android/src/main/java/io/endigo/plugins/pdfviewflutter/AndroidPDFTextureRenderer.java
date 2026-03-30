@@ -356,12 +356,16 @@ class AndroidPDFTextureRenderer {
                 renderExecutor.execute(() -> {
                     renderPage(target);
                     mainHandler.post(() -> {
+                        // Always complete the Future — never leave Flutter waiting
+                        // if dispose() ran while rendering.
                         if (!isDisposed) {
                             if (prev != target) {
                                 channel.invokeMethod("onPageChanged",
                                         mapOf("page", target, "total", totalPages));
                             }
                             result.success(true);
+                        } else {
+                            result.success(false);
                         }
                     });
                 });

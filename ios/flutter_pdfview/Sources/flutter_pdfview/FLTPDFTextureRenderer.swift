@@ -88,6 +88,10 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private(set) var channelName: String
     private(set) var pageCount: Int = 0
 
+    /// Set before tearing down the channel / texture so in-flight renders
+    /// skip callbacks and always complete pending platform `Result`s.
+    private var isDisposed = false
+
     private let textureRegistry: FlutterTextureRegistry
     private var channel: FlutterMethodChannel!
 
@@ -169,11 +173,12 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
     func dispose() {
         channel.setMethodCallHandler(nil)
-        textureRegistry.unregisterTexture(textureId)
-        pixelBufferPool = nil
         bufferLock.lock()
+        isDisposed = true
         latestPixelBuffer = nil
         bufferLock.unlock()
+        textureRegistry.unregisterTexture(textureId)
+        pixelBufferPool = nil
     }
 
     private func loadDocument(args: [String: Any]) {
@@ -191,7 +196,12 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
         guard let document = doc else {
             DispatchQueue.main.async { [weak self] in
-                self?.channel.invokeMethod("onError", arguments: [
+                guard let self = self else { return }
+                self.bufferLock.lock()
+                let dead = self.isDisposed
+                self.bufferLock.unlock()
+                guard !dead else { return }
+                self.channel.invokeMethod("onError", arguments: [
                     "error": "cannot create document: File not in PDF format or corrupted."
                 ])
             }
@@ -221,7 +231,12 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
             Self.renderSemaphore.wait()
             defer { Self.renderSemaphore.signal() }
             self.renderPage(self.currentPageIndex)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.bufferLock.lock()
+                let dead = self.isDisposed
+                self.bufferLock.unlock()
+                guard !dead else { return }
                 self.textureRegistry.textureFrameAvailable(self.textureId)
                 self.channel.invokeMethod("onRender", arguments: ["pages": pageCount])
                 self.channel.invokeMethod("onPageChanged", arguments: [
@@ -249,6 +264,12 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     }
 
     private func renderPage(_ pageIndex: Int) {
+        // Bail out early if dispose() was called while we were waiting in the queue.
+        bufferLock.lock()
+        let dead = isDisposed
+        bufferLock.unlock()
+        guard !dead else { return }
+
         guard let document = document,
               let page = document.page(at: pageIndex + 1) else { return }
 
@@ -309,7 +330,9 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
         CVPixelBufferUnlockBaseAddress(buffer, [])
 
         bufferLock.lock()
-        latestPixelBuffer = buffer
+        if !isDisposed {
+            latestPixelBuffer = buffer
+        }
         bufferLock.unlock()
     }
 
@@ -336,11 +359,25 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
                 let pageCount = doc.numberOfPages
 
                 renderQueue.async { [weak self] in
-                    guard let self = self else { return }
+                    guard let self = self else {
+                        DispatchQueue.main.async { result(false) }
+                        return
+                    }
                     Self.renderSemaphore.wait()
                     defer { Self.renderSemaphore.signal() }
                     self.renderPage(page)
-                    DispatchQueue.main.async {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else {
+                            result(false)
+                            return
+                        }
+                        self.bufferLock.lock()
+                        let dead = self.isDisposed
+                        self.bufferLock.unlock()
+                        guard !dead else {
+                            result(false)
+                            return
+                        }
                         self.textureRegistry.textureFrameAvailable(self.textureId)
                         if previousPage != page {
                             self.channel.invokeMethod("onPageChanged", arguments: [
