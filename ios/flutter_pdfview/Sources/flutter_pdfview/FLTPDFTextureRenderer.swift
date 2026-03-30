@@ -25,36 +25,60 @@ public class FLTPDFTextureFactory: NSObject {
 
     private func onMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
-        case "create":
-            guard let args = call.arguments as? [String: Any] else {
-                result(FlutterError(code: "INVALID_ARGS", message: "Expected dictionary arguments", details: nil))
-                return
-            }
-            let renderer = FLTPDFTextureRenderer(
-                args: args,
-                textureRegistry: textureRegistry,
-                messenger: messenger
-            )
-            renderers[renderer.channelName] = renderer
-            result([
-                "textureId": renderer.textureId,
-                "channelName": renderer.channelName,
-                "renderWidth": Int(renderer.renderSize.width),
-                "renderHeight": Int(renderer.renderSize.height),
-            ])
+            case "create":
+                guard let args = call.arguments as? [String: Any] else {
+                    result(FlutterError(code: "INVALID_ARGS", message: "Expected dictionary arguments", details: nil))
+                    return
+                }
+                let renderer = FLTPDFTextureRenderer(
+                    args: args,
+                    textureRegistry: textureRegistry,
+                    messenger: messenger
+                )
+                renderers[renderer.channelName] = renderer
+                result([
+                    "textureId": renderer.textureId,
+                    "channelName": renderer.channelName,
+                    "renderWidth": Int(renderer.renderSize.width),
+                    "renderHeight": Int(renderer.renderSize.height),
+                    "pageCount": renderer.pageCount,
+                ])
 
-        case "dispose":
-            guard let args = call.arguments as? [String: Any],
-                  let channelName = args["channelName"] as? String else {
-                result(FlutterError(code: "INVALID_ARGS", message: "Expected channelName", details: nil))
-                return
-            }
-            renderers[channelName]?.dispose()
-            renderers.removeValue(forKey: channelName)
-            result(nil)
+            case "dispose":
+                guard let args = call.arguments as? [String: Any],
+                    let channelName = args["channelName"] as? String else {
+                    result(FlutterError(code: "INVALID_ARGS", message: "Expected channelName", details: nil))
+                    return
+                }
+                renderers[channelName]?.dispose()
+                renderers.removeValue(forKey: channelName)
+                result(nil)
+                
+            case "getPageCount":
+                guard let args = call.arguments as? [String: Any] else {
+                    result(FlutterError(code: "INVALID_ARGS", message: "Expected dictionary arguments", details: nil))
+                    return
+                }
+                var doc: CGPDFDocument?
+                if let filePath = args["filePath"] as? String {
+                    doc = CGPDFDocument(URL(fileURLWithPath: filePath) as CFURL)
+                }
+                guard let document = doc else {
+                    result(0)
+                    return
+                }
+                if document.isEncrypted {
+                    if !document.unlockWithPassword("") {
+                        if let password = args["password"] as? String {
+                            _ = document.unlockWithPassword(password)
+                        }
+                    }
+                }
+                
+                result(document.numberOfPages)
 
-        default:
-            result(FlutterMethodNotImplemented)
+            default:
+                result(FlutterMethodNotImplemented)
         }
     }
 }
@@ -62,6 +86,7 @@ public class FLTPDFTextureFactory: NSObject {
 class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private(set) var textureId: Int64
     private(set) var channelName: String
+    private(set) var pageCount: Int = 0
 
     private let textureRegistry: FlutterTextureRegistry
     private var channel: FlutterMethodChannel!
@@ -73,11 +98,19 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     private var latestPixelBuffer: CVPixelBuffer?
     private let bufferLock = NSLock()
 
+    private var pixelBufferPool: CVPixelBufferPool?
+
+    // Concurrent queue so multiple page renderers run in parallel.
+    // Each renderer has its own CGPDFDocument, making concurrent access safe.
     private static let sharedRenderQueue = DispatchQueue(
         label: "io.endigo.pdfview.render",
-        qos: .background
+        qos: .userInitiated,
+        attributes: .concurrent
     )
-    private static let renderSemaphore = DispatchSemaphore(value: 2)
+    // Cap concurrency to the number of CPU cores to avoid thrashing.
+    private static let renderSemaphore = DispatchSemaphore(
+        value: max(2, ProcessInfo.processInfo.activeProcessorCount)
+    )
     private var renderQueue: DispatchQueue { Self.sharedRenderQueue }
 
     init(args: [String: Any], textureRegistry: FlutterTextureRegistry, messenger: FlutterBinaryMessenger) {
@@ -137,6 +170,7 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
     func dispose() {
         channel.setMethodCallHandler(nil)
         textureRegistry.unregisterTexture(textureId)
+        pixelBufferPool = nil
         bufferLock.lock()
         latestPixelBuffer = nil
         bufferLock.unlock()
@@ -175,10 +209,12 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
         self.document = document
 
         let pageCount = document.numberOfPages
+        self.pageCount = pageCount
         let defaultPage = min((args["defaultPage"] as? NSNumber)?.intValue ?? 0, max(0, pageCount - 1))
         self.currentPageIndex = defaultPage
 
         adjustRenderSize(for: args)
+        pixelBufferPool = Self.makePixelBufferPool(size: renderSize)
 
         renderQueue.async { [weak self] in
             guard let self = self else { return }
@@ -196,6 +232,22 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
         }
     }
 
+    private static func makePixelBufferPool(size: CGSize) -> CVPixelBufferPool? {
+        let width = Int(size.width)
+        let height = Int(size.height)
+        guard width > 0, height > 0 else { return nil }
+
+        let bufferAttrs: [CFString: Any] = [
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, bufferAttrs as CFDictionary, &pool)
+        return pool
+    }
+
     private func renderPage(_ pageIndex: Int) {
         guard let document = document,
               let page = document.page(at: pageIndex + 1) else { return }
@@ -205,20 +257,15 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
         let height = Int(size.height)
         guard width > 0, height > 0 else { return }
 
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any]
-        ]
-
         var newBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width, height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &newBuffer
-        )
-
-        guard status == kCVReturnSuccess, let buffer = newBuffer else { return }
+        if let pool = pixelBufferPool {
+            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &newBuffer)
+        }
+        if newBuffer == nil {
+            let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any]]
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &newBuffer)
+        }
+        guard let buffer = newBuffer else { return }
 
         CVPixelBufferLockBaseAddress(buffer, [])
 
@@ -268,70 +315,48 @@ class FLTPDFTextureRenderer: NSObject, FlutterTexture {
 
     private func onMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
-        case "pageCount":
-            result(document?.numberOfPages ?? 0)
+            case "pageCount":
+                result(document?.numberOfPages ?? 0)
 
-        case "currentPage":
-            result(currentPageIndex)
+            case "currentPage":
+                result(currentPageIndex)
 
-        case "setPage":
-            guard let args = call.arguments as? [String: Any],
-                  let page = (args["page"] as? NSNumber)?.intValue else {
-                result(FlutterError(code: "INVALID_ARGS", message: "Expected 'page' Int argument", details: nil))
-                return
-            }
-            guard let doc = document, page >= 0, page < doc.numberOfPages else {
-                result(false)
-                return
-            }
-            let previousPage = currentPageIndex
-            currentPageIndex = page
-            let pageCount = doc.numberOfPages
-
-            renderQueue.async { [weak self] in
-                guard let self = self else { return }
-                Self.renderSemaphore.wait()
-                defer { Self.renderSemaphore.signal() }
-                self.renderPage(page)
-                DispatchQueue.main.async {
-                    self.textureRegistry.textureFrameAvailable(self.textureId)
-                    if previousPage != page {
-                        self.channel.invokeMethod("onPageChanged", arguments: [
-                            "page": page,
-                            "total": pageCount
-                        ])
-                    }
-                    result(true)
+            case "setPage":
+                guard let args = call.arguments as? [String: Any],
+                    let page = (args["page"] as? NSNumber)?.intValue else {
+                    result(FlutterError(code: "INVALID_ARGS", message: "Expected 'page' Int argument", details: nil))
+                    return
                 }
-            }
+                guard let doc = document, page >= 0, page < doc.numberOfPages else {
+                    result(false)
+                    return
+                }
+                let previousPage = currentPageIndex
+                currentPageIndex = page
+                let pageCount = doc.numberOfPages
 
-        case "updateSettings":
-            result(nil)
-
-        case "getPageCount":
-            guard let args = call.arguments as? [String: Any] else {
-                result(FlutterError(code: "INVALID_ARGS", message: "Expected dictionary arguments", details: nil))
-                return
-            }
-            var doc: CGPDFDocument?
-            if let filePath = args["filePath"] as? String {
-                doc = CGPDFDocument(URL(fileURLWithPath: filePath) as CFURL)
-            }
-            guard let document = doc else {
-                result(0)
-                return
-            }
-            if document.isEncrypted {
-                if !document.unlockWithPassword("") {
-                    if let password = args["password"] as? String {
-                        _ = document.unlockWithPassword(password)
+                renderQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    Self.renderSemaphore.wait()
+                    defer { Self.renderSemaphore.signal() }
+                    self.renderPage(page)
+                    DispatchQueue.main.async {
+                        self.textureRegistry.textureFrameAvailable(self.textureId)
+                        if previousPage != page {
+                            self.channel.invokeMethod("onPageChanged", arguments: [
+                                "page": page,
+                                "total": pageCount
+                            ])
+                        }
+                        result(true)
                     }
                 }
-            }
-            result(document.numberOfPages)
 
-        default:
-            result(FlutterMethodNotImplemented)
+            case "updateSettings":
+                result(nil)
+
+            default:
+                result(FlutterMethodNotImplemented)
         }
     }
 }

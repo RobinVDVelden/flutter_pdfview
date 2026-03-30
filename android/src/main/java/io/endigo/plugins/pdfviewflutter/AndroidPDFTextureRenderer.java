@@ -46,6 +46,8 @@ class AndroidPDFTextureRenderer {
     int renderWidth;
     /** Physical pixel height of the rendered texture (page-fitted, no margins). */
     int renderHeight;
+    /** Total number of pages in the document; set synchronously during construction. */
+    int pageCount = 0;
 
     // ── internals ─────────────────────────────────────────────────────────────
     private final TextureRegistry.SurfaceTextureEntry textureEntry;
@@ -124,7 +126,7 @@ class AndroidPDFTextureRenderer {
             }
 
             pdfRenderer = new PdfRenderer(pfd);
-            int pageCount = pdfRenderer.getPageCount();
+            pageCount = pdfRenderer.getPageCount();
             if (pageCount == 0) {
                 sendError("PDF has no pages");
                 return;

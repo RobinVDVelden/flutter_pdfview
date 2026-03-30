@@ -58,6 +58,7 @@ class AndroidPDFTextureFactory {
                 response.put("channelName",  renderer.channelName);
                 response.put("renderWidth",  renderer.renderWidth);
                 response.put("renderHeight", renderer.renderHeight);
+                response.put("pageCount",    renderer.pageCount);
                 result.success(response);
                 break;
             }

@@ -193,6 +193,8 @@ class _PDFViewState extends State<PDFView> {
   int _currentPageIndex = 0;
   PageController? _pageController;
   Map<String, dynamic>? _pageBaseParams; // params reused by each _NativePageTexture
+  // Pre-created result for the defaultPage renderer (probe reuse).
+  Map<String, dynamic>? _probeResult;
 
   // ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -245,12 +247,12 @@ class _PDFViewState extends State<PDFView> {
 
       final textureId = result['textureId'] as int;
       final channelName = result['channelName'] as String;
-      final probeChannel = MethodChannel(channelName);
 
-      // pageCount is available synchronously after create() because the
-      // native renderer loads the PDFDocument before returning.
-      final pageCount =
-          await probeChannel.invokeMethod<int>('pageCount') ?? 1;
+      // pageCount is now included in the create() response, saving a round-trip.
+      // Fall back to a channel call for backward compatibility with older native builds.
+      final pageCount = (result['pageCount'] as int?) ??
+          await MethodChannel(channelName).invokeMethod<int>('pageCount') ??
+          1;
 
       if (_isDisposed || !mounted) {
         _disposeNativeChannel(channelName);
@@ -262,9 +264,8 @@ class _PDFViewState extends State<PDFView> {
       PDFViewController controller;
 
       if (usePageView) {
-        // Dispose the probe renderer — _NativePageTexture will create per-page ones.
-        _disposeNativeChannel(channelName);
-
+        // Keep the probe renderer alive — _NativePageTexture for defaultPage
+        // will reuse it directly, avoiding a second render of the same page.
         final pageController =
             PageController(initialPage: widget.defaultPage);
 
@@ -281,10 +282,11 @@ class _PDFViewState extends State<PDFView> {
           _currentPageIndex = widget.defaultPage;
           _pageController = pageController;
           _pageBaseParams = Map<String, dynamic>.from(params);
+          _probeResult = Map<String, dynamic>.from(result);
         });
       } else {
         // Keep the probe renderer as the single texture.
-        controller = PDFViewController._fromChannel(probeChannel, widget);
+        controller = PDFViewController._fromChannel(MethodChannel(channelName), widget);
 
         // Convert the physical render dimensions back to logical pixels so
         // the Texture widget can be sized to exactly the PDF page bounds.
@@ -357,6 +359,10 @@ class _PDFViewState extends State<PDFView> {
                     ? (pages) => widget.onRender?.call(pages)
                     : null,
                 onErrorCallback: (error) => widget.onError?.call(error),
+                // Reuse the probe renderer for defaultPage — avoids a second
+                // render of the same page and one platform channel round-trip.
+                preCreatedResult:
+                    index == widget.defaultPage ? _probeResult : null,
               ),
             ),
           ),
@@ -401,6 +407,10 @@ class _PDFViewState extends State<PDFView> {
     _isDisposed = true;
     _controller.future.then((PDFViewController c) => c.dispose());
     _disposeNativeChannel(_textureChannelName);
+    // The probe renderer is owned by _NativePageTexture for defaultPage once
+    // the PageView is built. Calling dispose here is a safe no-op if the widget
+    // already disposed it; it's a real cleanup if the tree was torn down early.
+    _disposeNativeChannel(_probeResult?['channelName'] as String?);
     _pageController?.dispose();
     super.dispose();
   }
@@ -421,6 +431,7 @@ class _NativePageTexture extends StatefulWidget {
     required this.backgroundColor,
     this.onRenderCallback,
     this.onErrorCallback,
+    this.preCreatedResult,
   });
 
   final int pageIndex;
@@ -436,6 +447,11 @@ class _NativePageTexture extends StatefulWidget {
 
   final void Function(int pages)? onRenderCallback;
   final void Function(dynamic error)? onErrorCallback;
+
+  /// When non-null the native renderer was already created (probe reuse).
+  /// The widget skips the `create` platform channel call and uses this result
+  /// directly, saving one render and one round-trip.
+  final Map<String, dynamic>? preCreatedResult;
 
   @override
   State<_NativePageTexture> createState() => _NativePageTextureState();
@@ -463,7 +479,41 @@ class _NativePageTextureState extends State<_NativePageTexture>
   @override
   void initState() {
     super.initState();
-    _createTexture();
+    final preCreated = widget.preCreatedResult;
+    if (preCreated != null) {
+      _setupFromPreCreated(preCreated);
+    } else {
+      _createTexture();
+    }
+  }
+
+  /// Synchronously sets up the texture from an already-created native renderer.
+  /// Called from [initState], so no [setState] is needed — assignments are
+  /// visible to the first [build] call.
+  void _setupFromPreCreated(Map<String, dynamic> result) {
+    final pixelRatio =
+        (widget.baseParams['pixelRatio'] as num?)?.toDouble() ?? 1.0;
+    final renderWidth = (result['renderWidth'] as num?)?.toInt() ??
+        (widget.baseParams['width'] as num?)?.toInt() ??
+        1;
+    final renderHeight = (result['renderHeight'] as num?)?.toInt() ??
+        (widget.baseParams['height'] as num?)?.toInt() ??
+        1;
+
+    _textureId = result['textureId'] as int;
+    _channelName = result['channelName'] as String;
+    _logicalWidth = renderWidth / pixelRatio;
+    _logicalHeight = renderHeight / pixelRatio;
+    _wantKeepAlive = true;
+
+    MethodChannel(_channelName!).setMethodCallHandler((call) async {
+      if (call.method == 'onRender') {
+        widget.onRenderCallback?.call(call.arguments['pages'] as int);
+      } else if (call.method == 'onError') {
+        widget.onErrorCallback?.call(call.arguments['error']);
+      }
+      return null;
+    });
   }
 
   Future<void> _createTexture() async {
